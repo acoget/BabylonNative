@@ -57,9 +57,13 @@ namespace Babylon
             bytes.insert(bytes.end(), ptr, ptr + stride);
         }
 
-        void AppendUniformBuffer(std::vector<uint8_t>& bytes, const spirv_cross::Compiler& compiler, const spirv_cross::Resource& uniformBuffer, bool isFragment)
+        void AppendUniformBuffer(std::vector<uint8_t>& bytes, const spirv_cross::Compiler& compiler, const spirv_cross::Resource& uniformBuffer, bool isFragment, bool needsQualifiedNames, std::unordered_map<std::string, std::string>& nameMap)
         {
             const uint8_t fragmentBit = (isFragment ? BGFX_UNIFORM_FRAGMENTBIT : 0);
+            // In GL reflection, uniforms in a struct have a Struct.Field name. Rename the resources here so the bgfx header matches with the source code.
+            std::string bufferName = "";
+            if (needsQualifiedNames)
+                bufferName = compiler.get_name(uniformBuffer.id) + ".";
 
             const spirv_cross::SPIRType& type = compiler.get_type(uniformBuffer.base_type_id);
             for (uint32_t index = 0; index < type.member_types.size(); ++index)
@@ -96,16 +100,19 @@ namespace Babylon
                     regCount *= size;
                 }
 
-                AppendBytes(bytes, static_cast<uint8_t>(name.size()));
+                AppendBytes(bytes, static_cast<uint8_t>(bufferName.size() + name.size()));
+                AppendBytes(bytes, bufferName);
                 AppendBytes(bytes, name);
                 AppendBytes(bytes, static_cast<uint8_t>(bgfxType | fragmentBit));
                 AppendBytes(bytes, static_cast<uint8_t>(0)); // Value "num" not used by D3D11 pipeline.
                 AppendBytes(bytes, static_cast<uint16_t>(offset));
                 AppendBytes(bytes, static_cast<uint16_t>(regCount));
+
+                nameMap[bufferName + name] = name;
             }
         }
 
-        void AppendSamplers(std::vector<uint8_t>& bytes, const spirv_cross::Compiler& compiler, const spirv_cross::SmallVector<spirv_cross::Resource>& samplers, bool isFragment, std::unordered_map<std::string, UniformInfo>& cache)
+        void AppendSamplers(std::vector<uint8_t>& bytes, const spirv_cross::Compiler& compiler, const spirv_cross::SmallVector<spirv_cross::Resource>& samplers, bool isFragment, std::unordered_map<std::string, UniformInfo>& cache, std::unordered_map<std::string, std::string>& nameMap)
         {
             for (const spirv_cross::Resource& sampler : samplers)
             {
@@ -119,10 +126,11 @@ namespace Babylon
                 AppendBytes(bytes, static_cast<uint16_t>(0));
 
                 cache[sampler.name].Stage = compiler.get_decoration(sampler.id, spv::DecorationBinding);
+                nameMap[sampler.name] = sampler.name;
             }
         }
 
-        void CacheUniformHandles(bgfx::ShaderHandle shader, std::unordered_map<std::string, UniformInfo>& cache)
+        void CacheUniformHandles(bgfx::ShaderHandle shader, const std::unordered_map<std::string, std::string>& nameMap, std::unordered_map<std::string, UniformInfo>& cache)
         {
             const auto MAX_UNIFORMS = 256;
             bgfx::UniformHandle uniforms[MAX_UNIFORMS];
@@ -132,7 +140,7 @@ namespace Babylon
             for (uint8_t idx = 0; idx < numUniforms; idx++)
             {
                 bgfx::getUniformInfo(uniforms[idx], info);
-                cache[info.name].Handle = uniforms[idx];
+                cache[nameMap.at(info.name)].Handle = uniforms[idx];
             }
         }
 
@@ -587,6 +595,11 @@ namespace Babylon
         std::vector<uint8_t> fragmentBytes{};
         std::unordered_map<std::string, uint32_t> attributeLocations;
 
+        // In GL reflection, uniforms in a struct have a Struct.Field name.
+        // That breaks the Babylon mapping, so we save an extra indirection to use when caching bgfx uniform handles.
+        std::unordered_map<std::string, std::string> vertexNameToName;
+        std::unordered_map<std::string, std::string> fragmentNameToName;
+
         m_shaderCompiler.Compile(vertexSource, fragmentSource, [&](ShaderCompiler::ShaderInfo vertexShaderInfo, ShaderCompiler::ShaderInfo fragmentShaderInfo) {
             constexpr uint8_t BGFX_SHADER_BIN_VERSION = 6;
 
@@ -595,27 +608,59 @@ namespace Babylon
             // crucial; they just have to match.
             constexpr uint32_t vertexOutputsHash = 0xBAD1DEA;
             constexpr uint32_t fragmentInputsHash = vertexOutputsHash;
+            bgfx::RendererType::Enum rendererType = bgfx::getRendererType();
+            const bool rendererisOpenGL = (rendererType == bgfx::RendererType::OpenGL || rendererType == bgfx::RendererType::OpenGLES);
 
             {
                 const spirv_cross::Compiler& compiler = *vertexShaderInfo.Compiler;
                 const spirv_cross::ShaderResources resources = compiler.get_shader_resources();
                 assert(resources.uniform_buffers.size() == 1);
-                const spirv_cross::Resource& uniformBuffer = resources.uniform_buffers[0];
-#if (BGFX_CONFIG_RENDERER_METAL)
-                // with metal, we bind images and not samplers
-                const spirv_cross::SmallVector<spirv_cross::Resource>& samplers = resources.separate_images;
-#else
-                const spirv_cross::SmallVector<spirv_cross::Resource>& samplers = resources.separate_samplers;
-#endif
-                size_t numUniforms = compiler.get_type(uniformBuffer.base_type_id).member_types.size() + samplers.size();
+
+                const spirv_cross::Resource uniformBuffer = resources.uniform_buffers[0];
+
+                const spirv_cross::SmallVector<spirv_cross::Resource>* samplers;
+                // With Metal, we bind images and not samplers
+                if (rendererType == bgfx::RendererType::Metal)
+                {
+                    samplers = &(resources.separate_images);
+                }
+                // With GL, we need to use the combined samplers. But that array has a different type, so we rebuild it.
+                else if (rendererisOpenGL)
+                {
+                    auto combinedSamplers = compiler.get_combined_image_samplers();
+                    spirv_cross::SmallVector<spirv_cross::Resource>* newSamplers = new spirv_cross::SmallVector<spirv_cross::Resource>();
+                    for (auto separate : resources.separate_samplers)
+                    {
+                        auto id = separate.id;
+                        auto baseTypeId = separate.base_type_id;
+                        auto typeId = separate.type_id;
+                        for (auto combined : combinedSamplers)
+                        {
+                            if (combined.sampler_id == id)
+                            {
+                                id = combined.combined_id;
+                                break;
+                            }
+                        }
+                        auto test = compiler.get_type_from_variable(id).self;
+                        newSamplers->push_back({id, baseTypeId, typeId, compiler.get_name(id)});
+                    }
+                    samplers = newSamplers;
+                }
+                else
+                {
+                    samplers = &(resources.separate_samplers);
+                }
+
+                size_t numUniforms = compiler.get_type(uniformBuffer.base_type_id).member_types.size() + samplers->size();
 
                 AppendBytes(vertexBytes, BX_MAKEFOURCC('V', 'S', 'H', BGFX_SHADER_BIN_VERSION));
                 AppendBytes(vertexBytes, vertexOutputsHash);
                 AppendBytes(vertexBytes, fragmentInputsHash);
 
                 AppendBytes(vertexBytes, static_cast<uint16_t>(numUniforms));
-                AppendUniformBuffer(vertexBytes, compiler, uniformBuffer, false);
-                AppendSamplers(vertexBytes, compiler, samplers, false, programData->VertexUniformNameToInfo);
+                AppendUniformBuffer(vertexBytes, compiler, uniformBuffer, false, rendererisOpenGL, vertexNameToName);
+                AppendSamplers(vertexBytes, compiler, *samplers, false, programData->VertexUniformNameToInfo, vertexNameToName);
 
                 AppendBytes(vertexBytes, static_cast<uint32_t>(vertexShaderInfo.Bytes.size()));
                 AppendBytes(vertexBytes, vertexShaderInfo.Bytes);
@@ -653,28 +698,64 @@ namespace Babylon
                 }
 
                 AppendBytes(vertexBytes, static_cast<uint16_t>(compiler.get_declared_struct_size(compiler.get_type(uniformBuffer.base_type_id))));
+
+                // GL needed to create a new array because combined samplers are a different type
+                if (rendererisOpenGL)
+                {
+                    delete samplers;
+                }
             }
 
             {
                 const spirv_cross::Compiler& compiler = *fragmentShaderInfo.Compiler;
                 const spirv_cross::ShaderResources resources = compiler.get_shader_resources();
                 assert(resources.uniform_buffers.size() == 1);
-                const spirv_cross::Resource& uniformBuffer = resources.uniform_buffers[0];
-#if __APPLE__
-                // with metal, we bind images and not samplers
-                const spirv_cross::SmallVector<spirv_cross::Resource>& samplers = resources.separate_images;
-#else
-                const spirv_cross::SmallVector<spirv_cross::Resource>& samplers = resources.separate_samplers;
-#endif
-                size_t numUniforms = compiler.get_type(uniformBuffer.base_type_id).member_types.size() + samplers.size();
+
+                const spirv_cross::Resource uniformBuffer = resources.uniform_buffers[0];
+
+                const spirv_cross::SmallVector<spirv_cross::Resource>* samplers;
+                // With Metal, we bind images and not samplers
+                if (rendererType == bgfx::RendererType::Metal)
+                {
+                    samplers = &(resources.separate_images);
+                }
+                // With GL, we need to use the combined samplers. But that array has a different type, so we rebuild it.
+                else if (rendererisOpenGL)
+                {
+                    auto combinedSamplers = compiler.get_combined_image_samplers();
+                    spirv_cross::SmallVector<spirv_cross::Resource>* newSamplers = new spirv_cross::SmallVector<spirv_cross::Resource>();
+                    for (auto separate : resources.separate_samplers)
+                    {
+                        auto id = separate.id;
+                        auto baseTypeId = separate.base_type_id;
+                        auto typeId = separate.type_id;
+                        for (auto combined : combinedSamplers)
+                        {
+                            if (combined.sampler_id == id)
+                            {
+                                id = combined.combined_id;
+                                break;
+                            }
+                        }
+                        auto test = compiler.get_type_from_variable(id).self;
+                        newSamplers->push_back({id, baseTypeId, typeId, compiler.get_name(id)});
+                    }
+                    samplers = newSamplers;
+                }
+                else
+                {
+                    samplers = &(resources.separate_samplers);
+                }
+
+                size_t numUniforms = compiler.get_type(uniformBuffer.base_type_id).member_types.size() + samplers->size();
 
                 AppendBytes(fragmentBytes, BX_MAKEFOURCC('F', 'S', 'H', BGFX_SHADER_BIN_VERSION));
                 AppendBytes(fragmentBytes, vertexOutputsHash);
                 AppendBytes(fragmentBytes, fragmentInputsHash);
 
                 AppendBytes(fragmentBytes, static_cast<uint16_t>(numUniforms));
-                AppendUniformBuffer(fragmentBytes, compiler, uniformBuffer, true);
-                AppendSamplers(fragmentBytes, compiler, samplers, true, programData->FragmentUniformNameToInfo);
+                AppendUniformBuffer(fragmentBytes, compiler, uniformBuffer, true, rendererisOpenGL, fragmentNameToName);
+                AppendSamplers(fragmentBytes, compiler, *samplers, true, programData->FragmentUniformNameToInfo, fragmentNameToName);
 
                 AppendBytes(fragmentBytes, static_cast<uint32_t>(fragmentShaderInfo.Bytes.size()));
                 AppendBytes(fragmentBytes, fragmentShaderInfo.Bytes);
@@ -684,15 +765,21 @@ namespace Babylon
                 AppendBytes(fragmentBytes, static_cast<uint8_t>(0));
 
                 AppendBytes(fragmentBytes, static_cast<uint16_t>(compiler.get_declared_struct_size(compiler.get_type(uniformBuffer.base_type_id))));
+
+                // GL needed to create a new array because combined samplers are a different type
+                if (rendererisOpenGL)
+                {
+                    delete samplers;
+                }
             }
         });
 
         auto vertexShader = bgfx::createShader(bgfx::copy(vertexBytes.data(), static_cast<uint32_t>(vertexBytes.size())));
-        CacheUniformHandles(vertexShader, programData->VertexUniformNameToInfo);
+        CacheUniformHandles(vertexShader, vertexNameToName, programData->VertexUniformNameToInfo);
         programData->AttributeLocations = std::move(attributeLocations);
 
         auto fragmentShader = bgfx::createShader(bgfx::copy(fragmentBytes.data(), static_cast<uint32_t>(fragmentBytes.size())));
-        CacheUniformHandles(fragmentShader, programData->FragmentUniformNameToInfo);
+        CacheUniformHandles(fragmentShader, fragmentNameToName, programData->FragmentUniformNameToInfo);
 
         programData->Program = bgfx::createProgram(vertexShader, fragmentShader, true);
 

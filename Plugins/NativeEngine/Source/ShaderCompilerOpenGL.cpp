@@ -38,8 +38,6 @@ namespace Babylon
 
             auto compiler = std::make_unique<spirv_cross::CompilerGLSL>(parser.get_parsed_ir());
 
-            compiler->build_combined_image_samplers();
-
             spirv_cross::CompilerGLSL::Options options = compiler->get_common_options();
 
 #ifdef ANDROID
@@ -49,83 +47,45 @@ namespace Babylon
             options.version = 430;
             options.es = false;
 #endif
+            // Plain uniforms rather than UBOs allows GLSL reflection - used by bgfx to set uniforms - to get valid locations instead of -1.
+            // Note that the uniforms still end up in a struct: the names are therefore Frame.uniformName and not just uniformName.
+            options.emit_uniform_buffer_as_plain_uniforms = true;
+
             compiler->set_common_options(options);
 
-            // rebuild uniform lists with the correct type
-            program.buildReflection();
-            int numUniforms = program.getNumUniformVariables();
+            // glslang works with Vulkan GLSL, which requires separate textures and samplers.
+            // But GL wants combined samplers + textures, so we build those.
+            compiler->build_combined_image_samplers();
 
-            for (int i = 0; i < numUniforms; i++)
+            // Remap the combined sampler names to human-friendly names and re-add the lost binding slot.
+            // Doing this here means the names and binding will be correct in the shader source, not just in reflection info.
+            const spirv_cross::ShaderResources resources = compiler->get_shader_resources();
+            auto combinedSamplers = compiler->get_combined_image_samplers();
+            for (auto separate : resources.separate_samplers)
             {
-                const auto& uniform = program.getUniform(i);
-                std::string uniformString = "uniform highp ";
-                switch (uniform.glDefineType)
+                auto id = separate.id;
+                auto& samplerName = separate.name;
+                auto binding = compiler->get_decoration(id, spv::DecorationBinding);
+                for (auto combined : combinedSamplers)
                 {
-                    case 0x8B5C: //GL_FLOAT_MAT4
-                        uniformString += "mat4 ";
-                        break;
-                    case 0:      // no type : skip
-                    case 0x8B5D: // GL_SAMPLER_1D
-                    case 0x8B5E: // GL_SAMPLER_2D
-                    case 0x8B5F: // GL_SAMPLER_3D
-                    case 0x8B60: // GL_SAMPLER_CUBE
-                        continue;
-                    default:
-                        uniformString += "vec4 ";
-                        break;
-                }
-                uniformString += uniform.name;
-                uniformString += ";";
-                compiler->add_header_line(uniformString);
-            }
-
-            std::string compiled = compiler->compile();
-
-            // rename "uniform Frame { .... }" . Keep the uniforms
-            const std::string frameNewName = ((stage == EShLangVertex) ? "FrameVS" : "FrameFS");
-            const std::string frame = "Frame";
-            size_t pos = compiled.find(frame);
-            if (pos != std::string::npos)
-            {
-                compiled.replace(pos, frame.size(), frameNewName);
-            }
-
-            spirv_cross::ShaderResources resources = compiler->get_shader_resources();
-            for (auto& resource : resources.uniform_buffers)
-            {
-                auto str = resource.name;
-                auto fbn = compiler->get_fallback_name(resource.id);
-                std::string rep = fbn + ".";
-                size_t pos = compiled.find(rep);
-                while (pos != std::string::npos)
-                {
-                    compiled.replace(pos, rep.size(), "");
-                    pos = compiled.find(rep);
-                }
-            }
-
-            auto combined = compiler->get_combined_image_samplers();
-            for (auto resource : resources.separate_samplers)
-            {
-                auto& samplerName = resource.name;
-                auto id = resource.id;
-                for (auto combine : combined)
-                {
-                    if (combine.sampler_id == id)
+                    if (combined.sampler_id == id)
                     {
-                        id = combine.combined_id;
+                        id = combined.combined_id;
                         break;
                     }
                 }
-                auto& fbn = compiler->get_fallback_name(id);
-                size_t pos = compiled.find(fbn);
-                while (pos != std::string::npos)
-                {
-                    compiled.replace(pos, fbn.size(), samplerName);
-                    pos = compiled.find(fbn);
-                }
+                compiler->set_name(id, samplerName);
+                compiler->set_decoration(id, spv::DecorationBinding, binding);
             }
 
+            // Because the uniform buffers get output as different structs in the VS and FS, the names don't match.
+            // Uniforms that should be shared between stages therefore get turned into two separate ones, but are only set once.
+            // We work around that by manually setting the struct instance name to something we control, matching between stages.
+            const spirv_cross::Resource uniformBuffer = resources.uniform_buffers[0];
+            compiler->set_name(uniformBuffer.id, "frameUniforms");
+
+            std::string compiled = compiler->compile();
+            
 #ifdef ANDROID
             glsl = compiled.substr(strlen("#version 300 es\n"));
 
