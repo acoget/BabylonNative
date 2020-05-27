@@ -47,8 +47,7 @@ namespace Babylon
             options.version = 430;
             options.es = false;
 #endif
-            // Plain uniforms rather than UBOs allows GLSL reflection - used by bgfx to set uniforms - to get valid locations instead of -1.
-            // Note that the uniforms still end up in a struct: the names are therefore Frame.uniformName and not just uniformName.
+            // This will make the struct emit as struct declaration + a variable, which is easier to work around. See below.
             options.emit_uniform_buffer_as_plain_uniforms = true;
 
             compiler->set_common_options(options);
@@ -58,7 +57,7 @@ namespace Babylon
             compiler->build_combined_image_samplers();
 
             // Remap the combined sampler names to human-friendly names and re-add the lost binding slot.
-            // Doing this here means the names and binding will be correct in the shader source, not just in reflection info.
+            // Doing this here means the names and binding will be correct in the shader source, and we can just use the separate samplers to build the bgfx header.
             const spirv_cross::ShaderResources resources = compiler->get_shader_resources();
             auto combinedSamplers = compiler->get_combined_image_samplers();
             for (auto separate : resources.separate_samplers)
@@ -78,14 +77,57 @@ namespace Babylon
                 compiler->set_decoration(id, spv::DecorationBinding, binding);
             }
 
-            // Because the uniform buffers get output as different structs in the VS and FS, the names don't match.
-            // Uniforms that should be shared between stages therefore get turned into two separate ones, but are only set once.
-            // We work around that by manually setting the struct instance name to something we control, matching between stages.
+            // SPIRV-Cross will only ever output uniform structs, whether as UBOs or as plain uniforms.
+            // That causes the names to be struct.field in GL reflection, which is what bgfx uses.
+            // If the structs have different names between the vertex and fragment stages, the same uniform gets duplicated due to the differece in qualified name, and only set once.
+            // If the structs have the same name between the vertex and fragment stages, but aren't identical (most cases), GLSL can't link the program.
+            // Therefore, the only feasible approach is to modify the shader code output by SPIRV-Cross and put plain non-struct uniforms back in.
+            // This cannot be done from Javascript, where it would be trivial, because value type uniforms that aren't inside a struct are invalid in Vulkan GLSL, which is what we use.
+            // And we can't use GL GLSL, because then neither the uniforms nor the samplers show up in the SPIRV-Cross reflection data we need to build the bgfx shader header.
+            // In practice, this adds a second copy of the uniforms in the header string before emitting the code.
+            // The struct will remain in shader code, unused, but it was the source of the reflection info that both this and NativeEngine use.
             const spirv_cross::Resource uniformBuffer = resources.uniform_buffers[0];
-            compiler->set_name(uniformBuffer.id, "frameUniforms");
+            const spirv_cross::SPIRType& type = compiler->get_type(uniformBuffer.base_type_id);
+            for (uint32_t index = 0; index < type.member_types.size(); ++index)
+            {
+                auto memberType = compiler->get_type(type.member_types[index]);
+
+                std::string uniformType;
+                auto uniformName = compiler->get_member_name(uniformBuffer.base_type_id, index);
+
+                // JS should have taken care of turning all uniforms into either vec4 or mat4
+                if (memberType.columns == 1 && memberType.vecsize == 4)
+                    uniformType = "vec4 ";
+                else if (memberType.columns == 4 && memberType.vecsize == 4)
+                    uniformType = "mat4 ";
+                else
+                    throw std::exception();
+
+                compiler->add_header_line("uniform " + uniformType + uniformName + ";");
+            }
+
+            // Rename the struct and make it clear it's unused
+            compiler->set_name(uniformBuffer.id, stage == EShLangVertex ? "UnusedVS" : "UnusedFS");
+            compiler->unset_decoration(uniformBuffer.id, spv::DecorationBinding);
 
             std::string compiled = compiler->compile();
-            
+
+            // Since we know exactly how the unused struct instance looks, we can comment it out to avoid noise in GL reflection...
+            const std::string unusedUniform = "uniform Frame Unused";
+            size_t pos = compiled.find(unusedUniform);
+            if (pos != std::string::npos)
+            {
+                compiled.replace(pos, unusedUniform.size(), "//uniform Frame Unused");
+            }
+            // ... and rewrite all the accesses so the shader actually compiles.
+            const std::string unusedUniformAccess = stage == EShLangVertex ? "UnusedVS." : "UnusedFS.";
+            pos = compiled.find(unusedUniformAccess);
+            while (pos != std::string::npos)
+            {
+                compiled.replace(pos, unusedUniformAccess.size(), "");
+                pos = compiled.find(unusedUniformAccess);
+            }
+
 #ifdef ANDROID
             glsl = compiled.substr(strlen("#version 300 es\n"));
 
